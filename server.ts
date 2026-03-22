@@ -88,6 +88,65 @@ const knownUsers = new Set<string>()
 // Map from_user_id → latest context_token. Required for sending replies.
 const contextTokenMap = new Map<string, string>()
 
+// --- Typing status ---
+
+// Cache typing_ticket per user (valid ~24h)
+const typingTicketMap = new Map<string, { ticket: string; fetchedAt: number }>()
+const TICKET_TTL_MS = 20 * 60 * 60 * 1000 // refresh after 20h to be safe
+
+// Track active typing keepalive timers per user (timer + ticket for teardown)
+const typingTimers = new Map<string, { timer: ReturnType<typeof setInterval>; ticket: string }>()
+
+async function fetchTypingTicket(userId: string, contextToken: string): Promise<string | null> {
+  const cached = typingTicketMap.get(userId)
+  if (cached && Date.now() - cached.fetchedAt < TICKET_TTL_MS) return cached.ticket
+  try {
+    const resp = await apiFetch('ilink/bot/getconfig', {
+      ilink_user_id: userId,
+      context_token: contextToken,
+      base_info: { channel_version: '0.1.0' },
+    })
+    if (resp.ret === 0 && resp.typing_ticket) {
+      typingTicketMap.set(userId, { ticket: resp.typing_ticket, fetchedAt: Date.now() })
+      return resp.typing_ticket
+    }
+  } catch (err) {
+    process.stderr.write(`weixin channel: getconfig failed for ${userId}: ${err}\n`)
+  }
+  return null
+}
+
+async function sendTyping(userId: string, ticket: string, status: 1 | 2): Promise<void> {
+  try {
+    await apiFetch('ilink/bot/sendtyping', {
+      ilink_user_id: userId,
+      typing_ticket: ticket,
+      status,
+      base_info: { channel_version: '0.1.0' },
+    })
+  } catch (err) {
+    process.stderr.write(`weixin channel: sendtyping status=${status} failed: ${err}\n`)
+  }
+}
+
+// Start typing indicator with 5s keepalive
+function startTyping(userId: string, ticket: string): void {
+  stopTyping(userId) // clear any existing timer
+  sendTyping(userId, ticket, 1)
+  const timer = setInterval(() => sendTyping(userId, ticket, 1), 5000)
+  typingTimers.set(userId, { timer, ticket })
+}
+
+// Stop typing: clear timer and send status=2 to dismiss the indicator
+async function stopTyping(userId: string): Promise<void> {
+  const entry = typingTimers.get(userId)
+  if (entry) {
+    clearInterval(entry.timer)
+    typingTimers.delete(userId)
+    await sendTyping(userId, entry.ticket, 2)
+  }
+}
+
 // --- API helpers ---
 
 function randomWechatUin(): string {
@@ -376,8 +435,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const chunks = chunk(text, limit)
 
-        for (const c of chunks) {
-          await sendMessage(userId, c, contextToken)
+        try {
+          for (const c of chunks) {
+            await sendMessage(userId, c, contextToken)
+          }
+        } finally {
+          // Always clear typing indicator, even if sendMessage throws
+          await stopTyping(userId)
         }
 
         return { content: [{ type: 'text', text: `sent ${chunks.length} chunk(s)` }] }
@@ -443,6 +507,12 @@ async function handleInbound(msg: any): Promise<void> {
   const ts = msg.create_time_ms
     ? new Date(msg.create_time_ms).toISOString()
     : new Date().toISOString()
+
+  // Show typing indicator while Claude is thinking
+  if (msg.context_token) {
+    const ticket = await fetchTypingTicket(senderId, msg.context_token)
+    if (ticket) startTyping(senderId, ticket)
+  }
 
   void mcp.notification({
     method: 'notifications/claude/channel',
