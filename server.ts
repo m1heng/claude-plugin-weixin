@@ -544,7 +544,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads WeChat (微信), not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from WeChat arrive as <channel source="weixin" user_id="..." context_token="..." ts="...">. Reply with the reply tool — pass user_id and context_token back. The context_token is REQUIRED for sending replies; without it the message will fail.',
+      'Messages from WeChat arrive as <channel source="weixin" user_id="..." context_token="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. Reply with the reply tool — pass user_id and context_token back. The context_token is REQUIRED for sending replies; without it the message will fail.',
       '',
       'WeChat has no message history API. If you need earlier context, ask the user to paste it or summarize.',
       '',
@@ -675,46 +675,21 @@ async function handleInbound(msg: any): Promise<void> {
     ? new Date(msg.create_time_ms).toISOString()
     : new Date().toISOString()
 
-  // Build MCP notification content blocks
-  const contentBlocks: any[] = []
-
-  if (text) {
-    contentBlocks.push({ type: 'text', text })
-  }
-
-  for (const imgPath of imagePaths) {
-    try {
-      const imgBuf = readFileSync(imgPath)
-      contentBlocks.push({
-        type: 'image',
-        data: imgBuf.toString('base64'),
-        mimeType: 'image/jpeg',
-      })
-    } catch (err) {
-      process.stderr.write(`weixin channel: failed to read image ${imgPath}: ${err}\n`)
-      contentBlocks.push({ type: 'text', text: '(image - read failed)' })
-    }
-  }
-
-  // Fallback if no content at all
-  if (contentBlocks.length === 0) {
-    contentBlocks.push({ type: 'text', text: '(empty message)' })
-  }
-
-  // For channel notifications, content is a string — combine text + image references
-  // MCP channel notifications use `content` as string, so we send text + image paths
-  const notificationText = text || (imagePaths.length > 0 ? '(image)' : '(empty message)')
+  // Channel notifications only support a single image_path in meta (like Telegram).
+  // Use the first image and mention extras in content text.
+  const imagePath = imagePaths.length > 0 ? imagePaths[0] : undefined
+  const contentText = text
+    || (imagePath ? '(photo)' : '(empty message)')
 
   void mcp.notification({
     method: 'notifications/claude/channel',
     params: {
-      content: notificationText,
-      contentBlocks,
+      content: contentText,
       meta: {
         user_id: senderId,
         ...(msg.context_token ? { context_token: msg.context_token } : {}),
         ts,
-        ...(imagePaths.length > 0 ? { image_paths: imagePaths } : {}),
+        ...(imagePath ? { image_path: imagePath } : {}),
       },
     },
   })
