@@ -15,19 +15,21 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { randomBytes } from 'crypto'
+import { randomBytes, createCipheriv, createDecipheriv, createHash } from 'crypto'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
-  statSync, renameSync, realpathSync,
+  statSync, renameSync, realpathSync, existsSync,
 } from 'fs'
 import { homedir } from 'os'
-import { join, sep } from 'path'
+import { join, sep, extname } from 'path'
 
 const STATE_DIR = join(homedir(), '.claude', 'channels', 'weixin')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const CREDENTIALS_FILE = join(STATE_DIR, 'credentials.json')
 const SYNC_BUF_FILE = join(STATE_DIR, 'sync_buf.txt')
+const MEDIA_DIR = join(STATE_DIR, 'media')
+const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c'
 
 // --- Load credentials ---
 
@@ -149,6 +151,202 @@ async function sendMessage(to: string, text: string, contextToken: string): Prom
       message_type: 2, // BOT
       message_state: 2, // FINISH
       item_list: [{ type: 1, text_item: { text } }],
+      context_token: contextToken,
+    },
+    base_info: { channel_version: '0.1.0' },
+  })
+}
+
+// --- AES-128-ECB crypto (for CDN image encrypt/decrypt) ---
+
+function encryptAesEcb(plaintext: Buffer, key: Buffer): Buffer {
+  const cipher = createCipheriv('aes-128-ecb', key, null)
+  return Buffer.concat([cipher.update(plaintext), cipher.final()])
+}
+
+function decryptAesEcb(ciphertext: Buffer, key: Buffer): Buffer {
+  const decipher = createDecipheriv('aes-128-ecb', key, null)
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()])
+}
+
+function aesEcbPaddedSize(plaintextSize: number): number {
+  return Math.ceil((plaintextSize + 1) / 16) * 16
+}
+
+/**
+ * Parse AES key from base64. Two formats in the wild:
+ * - base64(raw 16 bytes) → images
+ * - base64(hex string of 16 bytes) → file/voice/video
+ */
+function parseAesKey(aesKeyBase64: string): Buffer {
+  const decoded = Buffer.from(aesKeyBase64, 'base64')
+  if (decoded.length === 16) return decoded
+  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(decoded.toString('ascii'))) {
+    return Buffer.from(decoded.toString('ascii'), 'hex')
+  }
+  throw new Error(`aes_key must decode to 16 raw bytes or 32-char hex, got ${decoded.length} bytes`)
+}
+
+// --- CDN download + decrypt ---
+
+async function downloadAndDecryptImage(encryptQueryParam: string, aesKeyBase64: string): Promise<Buffer> {
+  const key = parseAesKey(aesKeyBase64)
+  const url = `${CDN_BASE_URL}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`CDN download ${res.status}: ${await res.text().catch(() => '')}`)
+  const encrypted = Buffer.from(await res.arrayBuffer())
+  return decryptAesEcb(encrypted, key)
+}
+
+async function downloadPlainCdnBuffer(encryptQueryParam: string): Promise<Buffer> {
+  const url = `${CDN_BASE_URL}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`CDN download ${res.status}: ${await res.text().catch(() => '')}`)
+  return Buffer.from(await res.arrayBuffer())
+}
+
+/**
+ * Download image from a message item. Returns local file path or null.
+ * Follows the same logic as the official Tencent OpenClaw plugin.
+ */
+async function downloadImageFromItem(item: any): Promise<string | null> {
+  const img = item.image_item
+  if (!img?.media?.encrypt_query_param) return null
+
+  // Resolve AES key: image_item.aeskey (hex) preferred, fallback to media.aes_key (base64)
+  const aesKeyBase64 = img.aeskey
+    ? Buffer.from(img.aeskey, 'hex').toString('base64')
+    : img.media.aes_key
+
+  try {
+    const buf = aesKeyBase64
+      ? await downloadAndDecryptImage(img.media.encrypt_query_param, aesKeyBase64)
+      : await downloadPlainCdnBuffer(img.media.encrypt_query_param)
+
+    mkdirSync(MEDIA_DIR, { recursive: true })
+    const filename = `img-${Date.now()}-${randomBytes(4).toString('hex')}.jpg`
+    const filePath = join(MEDIA_DIR, filename)
+    writeFileSync(filePath, buf)
+    return filePath
+  } catch (err) {
+    process.stderr.write(`weixin channel: image download failed: ${err}\n`)
+    return null
+  }
+}
+
+// --- CDN upload (for sending images) ---
+
+async function getUploadUrl(params: {
+  filekey: string
+  mediaType: number
+  toUserId: string
+  rawsize: number
+  rawfilemd5: string
+  filesize: number
+  aeskey: string
+}): Promise<{ upload_param?: string }> {
+  return apiFetch('ilink/bot/getuploadurl', {
+    filekey: params.filekey,
+    media_type: params.mediaType,
+    to_user_id: params.toUserId,
+    rawsize: params.rawsize,
+    rawfilemd5: params.rawfilemd5,
+    filesize: params.filesize,
+    no_need_thumb: true,
+    aeskey: params.aeskey,
+    base_info: { channel_version: '0.1.0' },
+  })
+}
+
+async function uploadBufferToCdn(params: {
+  buf: Buffer
+  uploadParam: string
+  filekey: string
+  aeskey: Buffer
+}): Promise<string> {
+  const ciphertext = encryptAesEcb(params.buf, params.aeskey)
+  const cdnUrl = `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(params.uploadParam)}&filekey=${encodeURIComponent(params.filekey)}`
+
+  const res = await fetch(cdnUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: new Uint8Array(ciphertext),
+  })
+  if (!res.ok) {
+    const errMsg = res.headers.get('x-error-message') ?? `status ${res.status}`
+    throw new Error(`CDN upload failed: ${errMsg}`)
+  }
+  const downloadParam = res.headers.get('x-encrypted-param')
+  if (!downloadParam) throw new Error('CDN upload response missing x-encrypted-param header')
+  return downloadParam
+}
+
+type UploadedImageInfo = {
+  downloadEncryptedQueryParam: string
+  aeskey: string
+  fileSize: number
+  fileSizeCiphertext: number
+}
+
+async function uploadImageToWeixin(filePath: string, toUserId: string): Promise<UploadedImageInfo> {
+  const plaintext = readFileSync(filePath)
+  const rawsize = plaintext.length
+  const rawfilemd5 = createHash('md5').update(plaintext).digest('hex')
+  const filesize = aesEcbPaddedSize(rawsize)
+  const filekey = randomBytes(16).toString('hex')
+  const aeskey = randomBytes(16)
+
+  const resp = await getUploadUrl({
+    filekey,
+    mediaType: 1, // IMAGE
+    toUserId,
+    rawsize,
+    rawfilemd5,
+    filesize,
+    aeskey: aeskey.toString('hex'),
+  })
+
+  if (!resp.upload_param) throw new Error('getUploadUrl returned no upload_param')
+
+  const downloadEncryptedQueryParam = await uploadBufferToCdn({
+    buf: plaintext,
+    uploadParam: resp.upload_param,
+    filekey,
+    aeskey,
+  })
+
+  return {
+    downloadEncryptedQueryParam,
+    aeskey: aeskey.toString('hex'),
+    fileSize: rawsize,
+    fileSizeCiphertext: filesize,
+  }
+}
+
+async function sendImageMessage(to: string, uploaded: UploadedImageInfo, contextToken: string, caption?: string): Promise<void> {
+  // Send caption as separate text message first if provided
+  if (caption) {
+    await sendMessage(to, caption, contextToken)
+  }
+
+  await apiFetch('ilink/bot/sendmessage', {
+    msg: {
+      from_user_id: '',
+      to_user_id: to,
+      client_id: `claude-weixin-${Date.now()}-${randomBytes(4).toString('hex')}`,
+      message_type: 2, // BOT
+      message_state: 2, // FINISH
+      item_list: [{
+        type: 2, // IMAGE
+        image_item: {
+          media: {
+            encrypt_query_param: uploaded.downloadEncryptedQueryParam,
+            aes_key: Buffer.from(uploaded.aeskey).toString('base64'),
+            encrypt_type: 1,
+          },
+          mid_size: uploaded.fileSizeCiphertext,
+        },
+      }],
       context_token: contextToken,
     },
     base_info: { channel_version: '0.1.0' },
@@ -299,16 +497,29 @@ function chunk(text: string, limit: number): string[] {
   return out
 }
 
-// --- Extract text from message items ---
+// --- Extract content from message items (text + images) ---
 
-function extractText(msg: any): string {
+type ExtractedContent = {
+  text: string
+  imagePaths: string[]
+}
+
+async function extractContent(msg: any): Promise<ExtractedContent> {
   const items = msg.item_list ?? []
   const parts: string[] = []
+  const imagePaths: string[] = []
+
   for (const item of items) {
     if (item.type === 1 && item.text_item?.text) {
       parts.push(item.text_item.text)
     } else if (item.type === 2) {
-      parts.push('(image)')
+      // Try to download image from CDN
+      const path = await downloadImageFromItem(item)
+      if (path) {
+        imagePaths.push(path)
+      } else {
+        parts.push('(image - download failed)')
+      }
     } else if (item.type === 3) {
       parts.push(item.voice_item?.text ?? '(voice)')
     } else if (item.type === 4) {
@@ -317,7 +528,11 @@ function extractText(msg: any): string {
       parts.push('(video)')
     }
   }
-  return parts.join('\n') || '(empty message)'
+
+  return {
+    text: parts.join('\n') || (imagePaths.length > 0 ? '' : '(empty message)'),
+    imagePaths,
+  }
 }
 
 // --- MCP Server ---
@@ -348,13 +563,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           user_id: { type: 'string', description: 'The from_user_id from the inbound message.' },
-          text: { type: 'string' },
+          text: { type: 'string', description: 'Text message to send. Required unless image_path is provided.' },
           context_token: {
             type: 'string',
             description: 'context_token from the inbound message. Required for delivery.',
           },
+          image_path: {
+            type: 'string',
+            description: 'Optional absolute path to a local image file to send. The image will be uploaded to WeChat CDN and delivered as an image message. If text is also provided, it will be sent as a caption before the image.',
+          },
         },
-        required: ['user_id', 'text', 'context_token'],
+        required: ['user_id', 'context_token'],
       },
     },
   ],
@@ -366,12 +585,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply': {
         const userId = args.user_id as string
-        const text = args.text as string
+        const text = (args.text as string) ?? ''
         const contextToken = args.context_token as string
+        const imagePath = args.image_path as string | undefined
 
         if (!contextToken) throw new Error('context_token is required')
         assertAllowedUser(userId)
 
+        // Send image if image_path provided
+        if (imagePath) {
+          assertSendable(imagePath)
+          if (!existsSync(imagePath)) throw new Error(`image file not found: ${imagePath}`)
+          const uploaded = await uploadImageToWeixin(imagePath, userId)
+          await sendImageMessage(userId, uploaded, contextToken, text || undefined)
+          return { content: [{ type: 'text', text: `sent image${text ? ' with caption' : ''}` }] }
+        }
+
+        // Text-only reply
+        if (!text) throw new Error('text or image_path is required')
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const chunks = chunk(text, limit)
@@ -439,19 +670,51 @@ async function handleInbound(msg: any): Promise<void> {
   // Message approved
   knownUsers.add(senderId)
 
-  const text = extractText(msg)
+  const { text, imagePaths } = await extractContent(msg)
   const ts = msg.create_time_ms
     ? new Date(msg.create_time_ms).toISOString()
     : new Date().toISOString()
 
+  // Build MCP notification content blocks
+  const contentBlocks: any[] = []
+
+  if (text) {
+    contentBlocks.push({ type: 'text', text })
+  }
+
+  for (const imgPath of imagePaths) {
+    try {
+      const imgBuf = readFileSync(imgPath)
+      contentBlocks.push({
+        type: 'image',
+        data: imgBuf.toString('base64'),
+        mimeType: 'image/jpeg',
+      })
+    } catch (err) {
+      process.stderr.write(`weixin channel: failed to read image ${imgPath}: ${err}\n`)
+      contentBlocks.push({ type: 'text', text: '(image - read failed)' })
+    }
+  }
+
+  // Fallback if no content at all
+  if (contentBlocks.length === 0) {
+    contentBlocks.push({ type: 'text', text: '(empty message)' })
+  }
+
+  // For channel notifications, content is a string — combine text + image references
+  // MCP channel notifications use `content` as string, so we send text + image paths
+  const notificationText = text || (imagePaths.length > 0 ? '(image)' : '(empty message)')
+
   void mcp.notification({
     method: 'notifications/claude/channel',
     params: {
-      content: text,
+      content: notificationText,
+      contentBlocks,
       meta: {
         user_id: senderId,
         ...(msg.context_token ? { context_token: msg.context_token } : {}),
         ts,
+        ...(imagePaths.length > 0 ? { image_paths: imagePaths } : {}),
       },
     },
   })
